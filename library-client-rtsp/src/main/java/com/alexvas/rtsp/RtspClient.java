@@ -204,12 +204,13 @@ public class RtspClient {
     public static final int AUDIO_CODEC_UNKNOWN = -1;
     public static final int AUDIO_CODEC_AAC = 0;
     public static final int AUDIO_CODEC_OPUS = 1;
-
+    public static final int AUDIO_CODEC_PCMA = 2;
     @NonNull
     private static String getAudioCodecName(int codec) {
         return switch (codec) {
             case AUDIO_CODEC_AAC -> "AAC";
             case AUDIO_CODEC_OPUS -> "Opus";
+            case AUDIO_CODEC_PCMA -> "PCMA";
             default -> "Unknown";
         };
     }
@@ -954,122 +955,118 @@ public class RtspClient {
     private static Track[] getTracksFromDescribeParams(@NonNull List<Pair<String, String>> params) {
         Track[] tracks = new Track[3];
         Track currentTrack = null;
+
         for (Pair<String, String> param: params) {
             switch (param.first) {
                 case "m":
-                    // m=video 0 RTP/AVP 96
-                    if (param.second.startsWith("video")) {
-                        currentTrack = new VideoTrack();
-                        tracks[0] = currentTrack;
+                    if (DEBUG) Log.d(TAG, "Processing media line: " + param.second);
 
-                    // m=audio 0 RTP/AVP 97
-                    } else if (param.second.startsWith("audio")) {
-                        currentTrack = new AudioTrack();
-                        tracks[1] = currentTrack;
-
-                    // m=application 0 RTP/AVP 99
-                    // a=rtpmap:99 com.my/90000
-                    } else if (param.second.startsWith("application")) {
-                        currentTrack = new ApplicationTrack();
-                        tracks[2] = currentTrack;
-
-                    } else if (param.second.startsWith("text")) {
-                        Log.w(TAG, "Media track 'text' is not supported");
-
-                    } else if (param.second.startsWith("message")) {
-                        Log.w(TAG, "Media track 'message' is not supported");
-
-                    } else {
-                        currentTrack = null;
+                    String[] values = TextUtils.split(param.second, " ");
+                    if (values.length < 4) {
+                        Log.e(TAG, "Invalid media description: " + param.second);
+                        continue;
                     }
 
-                    if (currentTrack != null) {
-                        // m=<media> <port>/<number of ports> <proto> <fmt> ...
-                        String[] values = TextUtils.split(param.second, " ");
-                        try {
-                            currentTrack.payloadType = (values.length > 3 ? Integer.parseInt(values[3]) : -1);
-                        } catch (Exception e) {
-                            currentTrack.payloadType = -1;
+                    try {
+                        int payloadType = Integer.parseInt(values[3]);
+
+                        if (param.second.startsWith("video")) {
+                            currentTrack = new VideoTrack();
+                            currentTrack.payloadType = payloadType;
+                            tracks[0] = currentTrack;
+                            if (DEBUG) Log.d(TAG, "Created video track with payload " + payloadType);
+
+                        } else if (param.second.startsWith("audio")) {
+                            currentTrack = new AudioTrack();
+                            currentTrack.payloadType = payloadType;
+                            tracks[1] = currentTrack;
+
+                            // Handle PCMA static payload type
+                            if (payloadType == 8) {
+                                AudioTrack audioTrack = (AudioTrack)currentTrack;
+                                audioTrack.audioCodec = AUDIO_CODEC_PCMA;
+                                audioTrack.sampleRateHz = 8000;
+                                audioTrack.channels = 1;
+                            }
+                            if (DEBUG) Log.d(TAG, "Created audio track with payload " + payloadType);
+
+                        } else if (param.second.startsWith("application")) {
+                            currentTrack = new ApplicationTrack();
+                            currentTrack.payloadType = payloadType;
+                            tracks[2] = currentTrack;
+                            if (DEBUG) Log.d(TAG, "Created application track with payload " + payloadType);
                         }
-                        if (currentTrack.payloadType == -1)
-                            Log.e(TAG, "Failed to get payload type from \"m=" + param.second + "\"");
+                    } catch (NumberFormatException e) {
+                        Log.e(TAG, "Failed to parse payload type from: " + param.second);
+                        currentTrack = null;
                     }
                     break;
 
                 case "a":
-                    // a=control:trackID=1
-                    if (currentTrack != null) {
-                        if (param.second.startsWith("control:")) {
-                            currentTrack.request = param.second.substring(8);
+                    if (currentTrack == null) continue;
 
-                        // a=fmtp:96 packetization-mode=1; profile-level-id=4D4029; sprop-parameter-sets=Z01AKZpmBkCb8uAtQEBAQXpw,aO48gA==
-                        // a=fmtp:97 streamtype=5; profile-level-id=15; mode=AAC-hbr; config=1408; sizeLength=13; indexLength=3; indexDeltaLength=3; profile=1; bitrate=32000;
-                        // a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1408
-                        // a=fmtp:96 streamtype=5; profile-level-id=14; mode=AAC-lbr; config=1388; sizeLength=6; indexLength=2; indexDeltaLength=2; constantDuration=1024; maxDisplacement=5
-                        // a=fmtp:96 profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1210fff15081ffdffc
-                        // a=fmtp:96
-                        } else if (param.second.startsWith("fmtp:")) {
-                            // Video
-                            if (currentTrack instanceof VideoTrack) {
-                                updateVideoTrackFromDescribeParam((VideoTrack)tracks[0], param);
-                            // Audio
-                            } else if (currentTrack instanceof AudioTrack) {
-                                updateAudioTrackFromDescribeParam((AudioTrack)tracks[1], param);
-                            }
+                    if (param.second.startsWith("control:")) {
+                        currentTrack.request = param.second.substring(8);
+                        if (DEBUG) Log.d(TAG, "Set track control: " + currentTrack.request);
 
-                        // a=rtpmap:96 H264/90000
-                        // a=rtpmap:97 mpeg4-generic/16000/1
-                        // a=rtpmap:97 MPEG4-GENERIC/16000
-                        // a=rtpmap:97 G726-32/8000
-                        // a=rtpmap:96 mpeg4-generic/44100/2
-                        } else if (param.second.startsWith("rtpmap:")) {
-                            // Video
-                            String[] values = TextUtils.split(param.second, " ");
-                            if (currentTrack instanceof VideoTrack) {
-                                if (values.length > 1) {
-                                    values = TextUtils.split(values[1], "/");
-                                    if (values.length > 0) {
-                                        switch (values[0].toLowerCase()) {
-                                            case "h264" -> ((VideoTrack) tracks[0]).videoCodec = VIDEO_CODEC_H264;
-                                            case "h265" -> ((VideoTrack) tracks[0]).videoCodec = VIDEO_CODEC_H265;
-                                            default -> Log.w(TAG, "Unknown video codec \"" + values[0] + "\"");
-                                        }
-                                        Log.i(TAG, "Video: " + values[0]);
-                                    }
+                    } else if (param.second.startsWith("rtpmap:")) {
+                        String[] rtpMapValues = TextUtils.split(param.second, " ");
+                        if (rtpMapValues.length <= 1) continue;
+
+                        if (currentTrack instanceof VideoTrack) {
+                            String[] codecInfo = TextUtils.split(rtpMapValues[1], "/");
+                            if (codecInfo.length > 0) {
+                                VideoTrack videoTrack = (VideoTrack)currentTrack;
+                                switch (codecInfo[0].toLowerCase()) {
+                                    case "h264" -> videoTrack.videoCodec = VIDEO_CODEC_H264;
+                                    case "h265" -> videoTrack.videoCodec = VIDEO_CODEC_H265;
                                 }
-
-                            // Audio
-                            } else if (currentTrack instanceof AudioTrack) {
-                                if (values.length > 1) {
-                                    AudioTrack track = ((AudioTrack) tracks[1]);
-                                    values = TextUtils.split(values[1], "/");
-                                    if (values.length > 1) {
-                                        switch (values[0].toLowerCase()) {
-                                            case "mpeg4-generic" -> track.audioCodec = AUDIO_CODEC_AAC;
-                                            case "opus" -> track.audioCodec = AUDIO_CODEC_OPUS;
-                                            default -> {
-                                                Log.w(TAG, "Unknown audio codec \"" + values[0] + "\"");
-                                                track.audioCodec = AUDIO_CODEC_UNKNOWN;
+                            }
+                        } else if (currentTrack instanceof AudioTrack) {
+                            AudioTrack audioTrack = (AudioTrack)currentTrack;
+                            String[] codecInfo = TextUtils.split(rtpMapValues[1], "/");
+                            if (codecInfo.length > 0) {
+                                switch (codecInfo[0].toLowerCase()) {
+                                    case "mpeg4-generic" -> audioTrack.audioCodec = AUDIO_CODEC_AAC;
+                                    case "opus" -> audioTrack.audioCodec = AUDIO_CODEC_OPUS;
+                                    case "pcma" -> {
+                                        audioTrack.audioCodec = AUDIO_CODEC_PCMA;
+                                        if (codecInfo.length > 1) {
+                                            try {
+                                                audioTrack.sampleRateHz = Integer.parseInt(codecInfo[1].trim());
+                                            } catch (NumberFormatException e) {
+                                                audioTrack.sampleRateHz = 8000;
                                             }
                                         }
-                                        track.sampleRateHz = Integer.parseInt(values[1]);
-                                        // If no channels specified, use mono, e.g. "a=rtpmap:97 MPEG4-GENERIC/8000"
-                                        track.channels = values.length > 2 ? Integer.parseInt(values[2]) : 1;
-                                        Log.i(TAG, "Audio: " + getAudioCodecName(track.audioCodec) + ", sample rate: " + track.sampleRateHz + " Hz, channels: " + track.channels);
+                                        audioTrack.channels = 1;
                                     }
                                 }
-
-                            // Application
-                            } else {
-                                // Do nothing
                             }
+                        }
+                    } else if (param.second.startsWith("fmtp:")) {
+                        if (currentTrack instanceof VideoTrack) {
+                            updateVideoTrackFromDescribeParam((VideoTrack)tracks[0],
+                                    Pair.create("a", param.second));
+                        } else if (currentTrack instanceof AudioTrack) {
+                            updateAudioTrackFromDescribeParam((AudioTrack)tracks[1],
+                                    Pair.create("a", param.second));
                         }
                     }
                     break;
             }
         }
+
+        if (DEBUG) {
+            Log.d(TAG, "Parsed tracks:");
+            if (tracks[0] != null) Log.d(TAG, "Video: " + tracks[0]);
+            if (tracks[1] != null) Log.d(TAG, "Audio: " + tracks[1]);
+            if (tracks[2] != null) Log.d(TAG, "Application: " + tracks[2]);
+        }
+
         return tracks;
     }
+
+
 
 //v=0
 //o=- 1542237507365806 1542237507365806 IN IP4 10.0.1.111
@@ -1112,15 +1109,35 @@ public class RtspClient {
     @NonNull
     private static List<Pair<String, String>> getDescribeParams(@NonNull String text) {
         ArrayList<Pair<String, String>> list = new ArrayList<>();
-        String[] params = TextUtils.split(text, "\r\n");
-        for (String param : params) {
-            int i = param.indexOf('=');
-            if (i > 0) {
-                String name = param.substring(0, i).trim();
-                String value = param.substring(i + 1);
-                list.add(Pair.create(name, value));
+        String[] lines = text.split("\r\n|\n");
+
+        if (DEBUG) {
+            Log.d(TAG, "Parsing SDP text:");
+            for (String line : lines) {
+                Log.d(TAG, "Line: " + line);
             }
         }
+
+        for (String line : lines) {
+            if (line.length() < 2) continue;
+
+            // Each SDP line should start with a single character followed by '='
+            char type = line.charAt(0);
+            if (line.charAt(1) != '=') continue;
+
+            String value = line.substring(2).trim();
+
+
+            list.add(new Pair<>(String.valueOf(type), value));
+        }
+
+        if (DEBUG) {
+            Log.d(TAG, "Parsed parameters:");
+            for (Pair<String, String> pair : list) {
+                Log.d(TAG, String.format("Type: '%s', Value: '%s'", pair.first, pair.second));
+            }
+        }
+
         return list;
     }
 
